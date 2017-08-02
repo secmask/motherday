@@ -1,0 +1,6 @@
+package: github.com/secmask/motherday
+import:
+- package: github.com/gorilla/websocket
+  version: ~1.2.0
+- package: github.com/labstack/echo
+  version: ~3.2.1
