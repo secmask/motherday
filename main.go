@@ -15,6 +15,7 @@ const (
 	defaultDiskPerPlayer        = 100
 	defaultRoundDurationSeconds = 60
 	playing                     = "playing"
+	waitingJoin                 = "waiting_join"
 	stop                        = "stop"
 
 	evGameStopped  = "game_stop"     // game stop because admin stop it, or timeout
@@ -31,7 +32,7 @@ var (
 	discsPerPlayer       int64 // this is not fixed number of disk deliver to one player, just help to calculate total disk for a round
 	state                = stop
 	roundDurationSeconds int64
-	gameRound            = GameRoundReport{}
+	gameRound            = GameRoundReport{JoinedPlayers: make(map[string]Player)}
 	timer                *time.Timer
 )
 
@@ -97,11 +98,11 @@ func eventHandler(context echo.Context) error {
 					continue
 				}
 				if discLeft := atomic.AddInt64(&gameRound.DiscLeft, -1); discLeft <= 0 {
+					state = stop
 					gameChannel.Send(&ServerMessage{
 						Type: evGameWin,
 					})
 					timer.Stop()
-					state = stop
 					log.Printf("game end because no disc left\n")
 				} else { // there're discs left, continue
 					err = c.WriteJSON(&ServerMessage{
@@ -153,6 +154,10 @@ func gameSetupHandler(context echo.Context) error {
 // gameJoinHandler process join game round for a player
 func gameJoinHandler(context echo.Context) error {
 
+	if state != waitingJoin {
+		return context.String(http.StatusLocked, "can't join during play")
+	}
+
 	playerID := context.Request().FormValue("player_id")
 	gameRound.JoinedPlayers[playerID] = Player{
 		ID: playerID,
@@ -164,14 +169,32 @@ func gameJoinHandler(context echo.Context) error {
 	return nil
 }
 
-func gameStartHandler(context echo.Context) error {
-	if state == playing {
-		//context.String(http.StatusOK, "already playing")
+func gameNewRoundHandler(context echo.Context) error {
+	switch state {
+	case playing:
+		state = stop
 		gameChannel.Send(&ServerMessage{
 			Type: evGameStopped,
 		})
-		state = stop
-		return nil
+		timer.Stop()
+	case waitingJoin:
+	case stop:
+	}
+
+	gameRound = GameRoundReport{
+		JoinedPlayers: make(map[string]Player),
+	}
+
+	gameRound.TotalDisc = discsPerPlayer * gameRound.JoinedPlayerCount
+	gameRound.DiscLeft = gameRound.TotalDisc
+
+	state = waitingJoin
+	return nil
+}
+
+func gameStartHandler(context echo.Context) error {
+	if state != waitingJoin {
+		return context.String(http.StatusBadRequest, "No game created, create a new one first")
 	}
 
 	gameRound = GameRoundReport{
@@ -184,6 +207,9 @@ func gameStartHandler(context echo.Context) error {
 	state = playing
 	timer = time.AfterFunc(time.Duration(roundDurationSeconds)*time.Second, func() {
 		state = stop
+		gameChannel.Send(&ServerMessage{
+			Type: evGameStopped,
+		})
 		log.Printf("game stop because out of time\n")
 	})
 	log.Printf("game start with %d discs and %d player\n", gameRound.TotalDisc, gameRound.JoinedPlayerCount)
@@ -200,6 +226,7 @@ func main() {
 	e.GET("/game_join", gameJoinHandler)
 	e.GET("/game_setup", gameSetupHandler)
 	e.GET("/game_start", gameStartHandler)
+	e.GET("/game_new", gameNewRoundHandler)
 	err := e.Start(":9090")
 	log.Panic(err)
 }
