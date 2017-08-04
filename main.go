@@ -29,10 +29,10 @@ var (
 	broadcastChannels = NewBroadcastChannels()
 	gameChannel       = broadcastChannels.GetOrCreate("the-only")
 
-	discsPerPlayer       int64 // this is not fixed number of disk deliver to one player, just help to calculate total disk for a round
-	state                = stop
-	roundDurationSeconds int64
-	gameRound            = GameRoundReport{JoinedPlayers: make(map[string]Player)}
+	discsPerPlayer       int64 = defaultDiskPerPlayer // this is not fixed number of disk deliver to one player, just help to calculate total disk for a round
+	state                      = stop
+	roundDurationSeconds int64 = defaultRoundDurationSeconds
+	gameRound                  = GameRoundReport{JoinedPlayers: make(map[string]Player)}
 	timer                *time.Timer
 )
 
@@ -87,7 +87,7 @@ func eventHandler(context echo.Context) error {
 			}
 			switch m.Type {
 			case "client_request_more":
-				if state == stop { // game has ended, client should receive game_done recently
+				if state == stop { // game has ended, client should receive game_stop recently
 					err = c.WriteJSON(&ServerMessage{
 						Type: evGameStopped,
 					})
@@ -95,6 +95,10 @@ func eventHandler(context echo.Context) error {
 						break
 					}
 					log.Printf("client_request_more on stopped game, ignore\n")
+					continue
+				}
+				if state == waitingJoin {
+					log.Printf("client %s should wait for game start event, ignore\n", m.ClientID)
 					continue
 				}
 				if discLeft := atomic.AddInt64(&gameRound.DiscLeft, -1); discLeft <= 0 {
@@ -109,6 +113,7 @@ func eventHandler(context echo.Context) error {
 						Type: evGameContinue,
 					})
 					if err != nil {
+						log.Printf("player disconnected %s, %v\n", m.ClientID, err)
 						break
 					}
 					log.Printf("player %s just cleanup a disk, number left %d\n", m.ClientID, discLeft)
@@ -195,10 +200,6 @@ func gameNewRoundHandler(context echo.Context) error {
 func gameStartHandler(context echo.Context) error {
 	if state != waitingJoin {
 		return context.String(http.StatusBadRequest, "No game created, create a new one first")
-	}
-
-	gameRound = GameRoundReport{
-		JoinedPlayers: make(map[string]Player),
 	}
 
 	gameRound.TotalDisc = discsPerPlayer * gameRound.JoinedPlayerCount
