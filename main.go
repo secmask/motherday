@@ -186,7 +186,7 @@ func gameSetupHandler(context echo.Context) error {
 	}
 
 	fmt.Fprintf(context.Response(), "disc_per_player = %d\n", discsPerPlayer)
-	fmt.Fprintf(context.Response(), "round_duration = %ds\n", roundDurationSeconds)
+	fmt.Fprintf(context.Response(), "round_time = %ds\n", roundDurationSeconds)
 
 	return nil
 }
