@@ -195,7 +195,7 @@ func gameSetupHandler(context echo.Context) error {
 func gameJoinHandler(context echo.Context) error {
 
 	if state != waitingJoin {
-		return context.String(http.StatusLocked, "can't join during play")
+		return context.String(http.StatusOK, "can't join during play")
 	}
 
 	playerID := context.Request().FormValue("player_id")
