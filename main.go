@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo"
-	"log"
+	l "log"
 	"net/http"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,7 @@ const (
 )
 
 var (
+	log               = l.New(os.Stdout, "", l.LstdFlags|l.Lshortfile)
 	upgrader          = websocket.Upgrader{} // use default options
 	broadcastChannels = NewBroadcastChannels()
 	gameChannel       = broadcastChannels.GetOrCreate("the-only")
@@ -104,6 +106,7 @@ func eventHandler(context echo.Context) error {
 				if state == stop { // game has ended, client should receive game_stop recently
 					err = c.WriteJSON(&ServerMessage{
 						Type: evGameStopped,
+						Data: map[string]interface{}{"reason": "eot"},
 					})
 					if err != nil {
 						break
@@ -221,6 +224,7 @@ func gameNewRoundHandler(context echo.Context) error {
 		state = stop
 		gameChannel.Send(&ServerMessage{
 			Type: evGameStopped,
+			Data: map[string]interface{}{"reason": "cancelled"},
 		})
 	case waitingJoin:
 	case stop:
@@ -267,6 +271,7 @@ func gameStartHandler(context echo.Context) error {
 				gameRound.PlayedTime = time.Since(gameRound.StartTime)
 				gameChannel.Send(&ServerMessage{
 					Type: evGameStopped,
+					Data: map[string]interface{}{"reason": "eot"},
 				})
 				ticker.Stop()
 				break
@@ -291,6 +296,20 @@ func mainScreenHandler(context echo.Context) error {
 		c.Close()
 		gameChannel.RemoveReceiver(r)
 	}()
+
+	go func() {
+		for {
+			m := ClientMessage{}
+			err := c.ReadJSON(&m)
+			if err != nil {
+				log.Printf("read json error %v\n", err)
+				break
+			}
+			log.Printf("got: %+v\n", m)
+			log.Printf("current game: %+v\n", gameRound)
+		}
+	}()
+
 	for {
 		select {
 		case event := <-outgoingChannel:

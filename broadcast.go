@@ -1,12 +1,12 @@
 package main
 
 import (
-	"log"
+	l "log"
 	"os"
 	"time"
 )
 
-var il = log.New(os.Stderr, "IL", log.LstdFlags|log.Lshortfile)
+var il = l.New(os.Stderr, "IL", l.LstdFlags|l.Lshortfile)
 
 type Receiver interface {
 	Chan() chan interface{}
