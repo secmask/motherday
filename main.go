@@ -221,12 +221,12 @@ func gameNewRoundHandler(context echo.Context) error {
 	switch state {
 	case playing:
 		ticker.Stop()
-		state = stop
+		fallthrough
+	case waitingJoin:
 		gameChannel.Send(&ServerMessage{
 			Type: evGameStopped,
 			Data: map[string]interface{}{"reason": "cancelled"},
 		})
-	case waitingJoin:
 	case stop:
 	}
 
