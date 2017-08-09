@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo"
@@ -323,6 +324,8 @@ func mainScreenHandler(context echo.Context) error {
 }
 
 func main() {
+	var bindAddr = ":9090"
+	flag.StringVar(&bindAddr, "bind-address", ":9090", "bind address")
 	e := echo.New()
 	e.Static("/content", "./content")
 	e.GET("/game_event", eventHandler)
@@ -331,6 +334,6 @@ func main() {
 	e.GET("/game_start", gameStartHandler)
 	e.GET("/game_main_screen", mainScreenHandler)
 	e.GET("/game_new", gameNewRoundHandler)
-	err := e.Start(":9090")
+	err := e.Start(bindAddr)
 	log.Panic(err)
 }
