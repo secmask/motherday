@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo"
+	"github.com/pkg/errors"
 	l "log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -20,12 +22,13 @@ const (
 	waitingJoin                 = "waiting_join"
 	stop                        = "stop"
 
-	evGameStopped  = "game_stop"          // game stop because admin stop it, or timeout
-	evGameWin      = "game_win"           // game stop because all of disc has clean
-	evGameContinue = "game_continue"      // there're more discs left
-	evGameStart    = "game_start"         // a new game just get started, client should send 'client_request_more' to pull new disc
-	evPlayerJoined = "game_player_joined" // announce that a new player just joined
-	evProgress     = "game_progress"      // send out playing statistic
+	evGameStopped     = "game_stop"          // game stop because admin stop it, or timeout
+	evGameWin         = "game_win"           // game stop because all of disc has clean
+	evGameContinue    = "game_continue"      // there're more discs left
+	evGameWaitingJoin = "game_waiting_join"  // waiting for join game
+	evGameStart       = "game_start"         // a new game just get started, client should send 'client_request_more' to pull new disc
+	evPlayerJoined    = "game_player_joined" // announce that a new player just joined
+	evProgress        = "game_progress"      // send out playing statistic
 )
 
 var (
@@ -38,7 +41,8 @@ var (
 	state                      = stop
 	roundDurationSeconds int64 = defaultRoundDurationSeconds
 	gameRound                  = GameRoundReport{JoinedPlayers: make(map[string]Player)}
-	ticker               *time.Ticker
+	progressTicker       *time.Ticker
+	gameStartingTicker   *time.Ticker
 )
 
 type GameRoundReport struct {
@@ -138,7 +142,7 @@ func eventHandler(context echo.Context) error {
 								"state":        state,
 							},
 						})
-						ticker.Stop()
+						progressTicker.Stop()
 						log.Printf("game end because all the disc has been cleaned\n")
 					}
 				} else { // there're discs left, continue
@@ -195,10 +199,34 @@ func gameSetupHandler(context echo.Context) error {
 // gameJoinHandler process join game round for a player
 func gameJoinHandler(context echo.Context) error {
 
-	if state != waitingJoin {
+	if state == playing {
 		return context.String(http.StatusOK, "can't join during play")
 	}
-
+	if state == stop { // new game on first join
+		gameRound = GameRoundReport{
+			JoinedPlayers: make(map[string]Player),
+		}
+		state = waitingJoin
+		if gameStartingTicker != nil {
+			gameStartingTicker.Stop()
+		}
+		gameStartingTicker = time.NewTicker(time.Second)
+		go func() {
+			seconds := 30
+			for range gameStartingTicker.C {
+				gameChannel.Send(&ServerMessage{
+					Type: evGameWaitingJoin,
+					Data: map[string]interface{}{"seconds": seconds},
+				})
+				seconds = seconds - 1
+				if seconds == -1 {
+					startGame()
+					gameStartingTicker.Stop()
+					break
+				}
+			}
+		}()
+	}
 	playerID := context.Request().FormValue("player_id")
 	gameRound.JoinedPlayers[playerID] = Player{
 		ID: playerID,
@@ -218,29 +246,9 @@ func gameJoinHandler(context echo.Context) error {
 	return nil
 }
 
-func gameNewRoundHandler(context echo.Context) error {
-	switch state {
-	case playing:
-		ticker.Stop()
-		fallthrough
-	case waitingJoin:
-		gameChannel.Send(&ServerMessage{
-			Type: evGameStopped,
-			Data: map[string]interface{}{"reason": "cancelled"},
-		})
-	case stop:
-	}
-
-	gameRound = GameRoundReport{
-		JoinedPlayers: make(map[string]Player),
-	}
-	state = waitingJoin
-	return nil
-}
-
-func gameStartHandler(context echo.Context) error {
+func startGame() error {
 	if state != waitingJoin {
-		return context.String(http.StatusBadRequest, "No game created, create a new one first")
+		return errors.New("No game created, create a new one first")
 	}
 
 	gameRound.TotalDisc = discsPerPlayer * gameRound.JoinedPlayerCount
@@ -249,13 +257,13 @@ func gameStartHandler(context echo.Context) error {
 	gameRound.StartTime = time.Now()
 	state = playing
 
-	ticker = time.NewTicker(time.Second)
+	progressTicker = time.NewTicker(time.Second)
 	log.Printf("game start with %d discs and %d player\n", gameRound.TotalDisc, gameRound.JoinedPlayerCount)
 	gameChannel.Send(&ServerMessage{
 		Type: evGameStart,
 	})
 	go func() {
-		for range ticker.C {
+		for range progressTicker.C {
 			secondsLeft := atomic.AddInt64(&gameRound.SecondsLeft, -1)
 			gameChannel.Send(&ServerMessage{
 				Type: evProgress,
@@ -274,7 +282,7 @@ func gameStartHandler(context echo.Context) error {
 					Type: evGameStopped,
 					Data: map[string]interface{}{"reason": "eot"},
 				})
-				ticker.Stop()
+				progressTicker.Stop()
 				break
 			}
 		}
@@ -326,14 +334,16 @@ func mainScreenHandler(context echo.Context) error {
 func main() {
 	var bindAddr = ":9090"
 	flag.StringVar(&bindAddr, "bind-address", ":9090", "bind address")
+	flag.Parse()
 	e := echo.New()
 	e.Static("/content", "./content")
 	e.GET("/game_event", eventHandler)
 	e.GET("/game_join", gameJoinHandler)
 	e.GET("/game_setup", gameSetupHandler)
-	e.GET("/game_start", gameStartHandler)
 	e.GET("/game_main_screen", mainScreenHandler)
-	e.GET("/game_new", gameNewRoundHandler)
+	go func() {
+		http.ListenAndServe(":5555", nil)
+	}()
 	err := e.Start(bindAddr)
 	log.Panic(err)
 }
