@@ -5,30 +5,37 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo"
-	"github.com/pkg/errors"
 	l "log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
 const (
-	defaultDiskPerPlayer        = 100
-	defaultRoundDurationSeconds = 60
+	defaultDiskPerPlayer        = 30
+	defaultRoundDurationSeconds = 30
 	playing                     = "playing"
 	waitingJoin                 = "waiting_join"
 	stop                        = "stop"
 
-	evGameStopped     = "game_stop"          // game stop because admin stop it, or timeout
-	evGameWin         = "game_win"           // game stop because all of disc has clean
-	evGameContinue    = "game_continue"      // there're more discs left
-	evGameWaitingJoin = "game_waiting_join"  // waiting for join game
+	evGameNew         = "game_new"
+	evGameStopped     = "game_stop"         // game stop because admin stop it, or timeout
+	evGameWin         = "game_win"          // game stop because all of disc has clean
+	evGameContinue    = "game_continue"     // there're more discs left
+	evGameWaitingJoin = "game_waiting_join" // waiting for join game
+	evLater           = "game_later"
 	evGameStart       = "game_start"         // a new game just get started, client should send 'client_request_more' to pull new disc
 	evPlayerJoined    = "game_player_joined" // announce that a new player just joined
 	evProgress        = "game_progress"      // send out playing statistic
+
+)
+
+const (
+	clientJoinGame  = "join_game"
+	clientFetchDisc = "fetch_disc"
 )
 
 var (
@@ -37,23 +44,23 @@ var (
 	broadcastChannels = NewBroadcastChannels()
 	gameChannel       = broadcastChannels.GetOrCreate("the-only")
 
-	discsPerPlayer       int64 = defaultDiskPerPlayer // this is not fixed number of disk deliver to one player, just help to calculate total disk for a round
-	state                      = stop
+	discsPerPlayer       int64 = defaultDiskPerPlayer // this is not fixed number of disk for one player, just help to calculate total disk for a round
 	roundDurationSeconds int64 = defaultRoundDurationSeconds
-	gameRound                  = GameRoundReport{JoinedPlayers: make(map[string]Player)}
-	progressTicker       *time.Ticker
+	gameState            *GameState
+	gsLock               sync.Mutex
 	gameStartingTicker   *time.Ticker
 )
 
-type GameRoundReport struct {
-	TotalDisc         int64
-	DiscLeft          int64
-	CleanItem         int64
-	StartTime         time.Time
-	SecondsLeft       int64
-	PlayedTime        time.Duration
-	JoinedPlayerCount int64
-	JoinedPlayers     map[string]Player
+type GameState struct {
+	TotalDisc         int64             `json:"total_disc"`
+	DiscLeft          int64             `json:"disc_left"`
+	CleanItem         int64             `json:"clean_item"`
+	StartTime         time.Time         `json:"start_time"`
+	SecondsLeft       int64             `json:"seconds_left"`
+	PlayedTime        time.Duration     `json:"played_time"`
+	PlayedTimeSeconds float64           `json:"played_time_seconds"`
+	JoinedPlayers     map[string]Player `json:"joined_players"`
+	State             string
 }
 
 type Player struct {
@@ -67,8 +74,8 @@ type ClientMessage struct {
 }
 
 type ServerMessage struct {
-	Type string
-	Data map[string]interface{}
+	Type string                 `json:"type"`
+	Data map[string]interface{} `json:"data"`
 }
 
 type receiver0 struct {
@@ -77,101 +84,6 @@ type receiver0 struct {
 
 func (r receiver0) Chan() chan interface{} {
 	return r.c
-}
-
-func eventHandler(context echo.Context) error {
-	c, err := upgrader.Upgrade(context.Response(), context.Request(), nil)
-	if err != nil {
-		log.Printf("upgrade:", err)
-		return err
-	}
-
-	outgoingChannel := make(chan interface{}, 32)
-	eventReceiver := &receiver0{outgoingChannel}
-	gameChannel.AddReceiver(eventReceiver)
-	defer func() {
-		c.Close()
-		gameChannel.RemoveReceiver(eventReceiver)
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		for {
-			m := ClientMessage{}
-			err := c.ReadJSON(&m)
-			if err != nil {
-				log.Printf("read json error %v\n", err)
-				break
-			}
-			log.Printf("got: %+v\n", m)
-			log.Printf("current game: %+v\n", gameRound)
-			switch m.Type {
-			case "client_request_more":
-				count := m.Data["count"]
-				if state == stop { // game has ended, client should receive game_stop recently
-					err = c.WriteJSON(&ServerMessage{
-						Type: evGameStopped,
-						Data: map[string]interface{}{"reason": "eot"},
-					})
-					if err != nil {
-						break
-					}
-					log.Printf("client_request_more on stopped game, ignore\n")
-					break
-				}
-				if state == waitingJoin {
-					log.Printf("client %s should wait for game start event, ignore\n", m.ClientID)
-					break
-				}
-				var discLeft = atomic.LoadInt64(&gameRound.DiscLeft)
-				if count == "1" {
-					discLeft = atomic.AddInt64(&gameRound.DiscLeft, -1)
-					atomic.AddInt64(&gameRound.CleanItem, 1)
-				}
-				if discLeft <= 0 {
-					if discLeft == 0 {
-						state = stop
-						gameRound.PlayedTime = time.Since(gameRound.StartTime)
-						gameChannel.Send(&ServerMessage{
-							Type: evGameWin,
-							Data: map[string]interface{}{
-								"total_disc":   gameRound.TotalDisc,
-								"clean_disc":   gameRound.CleanItem,
-								"player_count": gameRound.JoinedPlayerCount,
-								"played_time":  gameRound.PlayedTime.Seconds(),
-								"state":        state,
-							},
-						})
-						progressTicker.Stop()
-						log.Printf("game end because all the disc has been cleaned\n")
-					}
-				} else { // there're discs left, continue
-					err = c.WriteJSON(&ServerMessage{
-						Type: evGameContinue,
-					})
-					if err != nil {
-						log.Printf("player disconnected %s, %v\n", m.ClientID, err)
-						break
-					}
-					log.Printf("player %s just cleanup a disk, number left %d\n", m.ClientID, discLeft)
-				}
-			}
-		}
-		close(done)
-	}()
-
-	for {
-		select {
-		case event := <-outgoingChannel:
-			if err := c.WriteJSON(event); err != nil {
-				break
-			}
-		case <-done:
-			break
-		}
-	}
-
-	return nil
 }
 
 func gameSetupHandler(context echo.Context) error {
@@ -196,117 +108,94 @@ func gameSetupHandler(context echo.Context) error {
 	return nil
 }
 
-// gameJoinHandler process join game round for a player
-func gameJoinHandler(context echo.Context) error {
-
-	if state == playing {
-		return context.String(http.StatusOK, "can't join during play")
-	}
-	if state == stop { // new game on first join
-		gameRound = GameRoundReport{
-			JoinedPlayers: make(map[string]Player),
-		}
-		state = waitingJoin
-		if gameStartingTicker != nil {
-			gameStartingTicker.Stop()
-		}
-		gameStartingTicker = time.NewTicker(time.Second)
-		go func() {
-			seconds := 30
-			for range gameStartingTicker.C {
-				gameChannel.Send(&ServerMessage{
-					Type: evGameWaitingJoin,
-					Data: map[string]interface{}{"seconds": seconds},
-				})
-				seconds = seconds - 1
-				if seconds == -1 {
-					startGame()
-					gameStartingTicker.Stop()
-					break
-				}
-			}
-		}()
-	}
-	playerID := context.Request().FormValue("player_id")
-	gameRound.JoinedPlayers[playerID] = Player{
-		ID: playerID,
-	}
-	count := atomic.AddInt64(&gameRound.JoinedPlayerCount, 1)
-	context.String(http.StatusOK, "OK")
-	log.Printf("%s just join, we have %d player now\n", playerID, count)
-
-	ids := make([]string, 0, len(gameRound.JoinedPlayers))
-	for p, _ := range gameRound.JoinedPlayers {
-		ids = append(ids, p)
-	}
-	gameChannel.Send(&ServerMessage{
-		Type: evPlayerJoined,
-		Data: map[string]interface{}{"players": ids},
-	})
-	return nil
-}
-
-func startGame() error {
-	if state != waitingJoin {
-		return errors.New("No game created, create a new one first")
-	}
-
-	gameRound.TotalDisc = discsPerPlayer * gameRound.JoinedPlayerCount
-	gameRound.DiscLeft = gameRound.TotalDisc
-	gameRound.SecondsLeft = roundDurationSeconds
-	gameRound.StartTime = time.Now()
-	state = playing
-
-	progressTicker = time.NewTicker(time.Second)
-	log.Printf("game start with %d discs and %d player\n", gameRound.TotalDisc, gameRound.JoinedPlayerCount)
-	gameChannel.Send(&ServerMessage{
-		Type: evGameStart,
-	})
-	go func() {
-		for range progressTicker.C {
-			secondsLeft := atomic.AddInt64(&gameRound.SecondsLeft, -1)
-			gameChannel.Send(&ServerMessage{
-				Type: evProgress,
+func startCountingStartGame() {
+	gameStartingTicker = time.NewTicker(time.Second)
+	var timeCountDown int64 = 15
+	for range gameStartingTicker.C {
+		gameChannel.Send(ServerMessage{
+			Type: evGameWaitingJoin,
+			Data: map[string]interface{}{
+				"state":   gameState,
+				"seconds": timeCountDown,
+			},
+		})
+		log.Printf("waiting for player join %d\n", timeCountDown)
+		timeCountDown = timeCountDown - 1
+		if timeCountDown == -1 {
+			gsLock.Lock()
+			gameState.TotalDisc = int64(len(gameState.JoinedPlayers)) * discsPerPlayer
+			gameState.StartTime = time.Now()
+			gameState.DiscLeft = gameState.TotalDisc
+			gameState.SecondsLeft = roundDurationSeconds
+			gameState.State = playing
+			gsLock.Unlock()
+			gameChannel.Send(ServerMessage{
+				Type: evGameStart,
 				Data: map[string]interface{}{
-					"time_left":    secondsLeft,
-					"total_disc":   gameRound.TotalDisc,
-					"clean_disc":   gameRound.CleanItem,
-					"player_count": gameRound.JoinedPlayerCount,
-					"state":        state,
+					"state": gameState,
 				},
 			})
-			if secondsLeft == 0 {
-				state = stop
-				gameRound.PlayedTime = time.Since(gameRound.StartTime)
-				gameChannel.Send(&ServerMessage{
-					Type: evGameStopped,
-					Data: map[string]interface{}{"reason": "eot"},
-				})
-				progressTicker.Stop()
-				break
-			}
+			break
 		}
-	}()
+	}
+	timeCountDown = gameState.SecondsLeft
+	for range gameStartingTicker.C {
+		gsLock.Lock()
+		gameState.PlayedTime = time.Now().Sub(gameState.StartTime)
+		gameState.PlayedTimeSeconds = gameState.PlayedTime.Seconds()
+		gameState.SecondsLeft = timeCountDown
+		gsLock.Unlock()
 
-	return nil
+		log.Printf("game end in %d\n", timeCountDown)
+		if timeCountDown == -1 {
+			gsLock.Lock()
+			gameState.State = stop
+			gsLock.Unlock()
+			gameChannel.Send(ServerMessage{
+				Type: evGameStopped,
+				Data: map[string]interface{}{
+					"state":   gameState,
+					"seconds": 0,
+				},
+			})
+			break
+		} else {
+			gameChannel.Send(ServerMessage{
+				Type: evProgress,
+				Data: map[string]interface{}{
+					"state":   gameState,
+					"seconds": timeCountDown,
+				},
+			})
+		}
+		timeCountDown = timeCountDown - 1
+	}
 }
 
-func mainScreenHandler(context echo.Context) error {
+func gameJoin(context echo.Context) error {
 	c, err := upgrader.Upgrade(context.Response(), context.Request(), nil)
 	if err != nil {
 		log.Printf("upgrade:", err)
 		return err
 	}
+	done := make(chan struct{})
 
 	outgoingChannel := make(chan interface{}, 32)
-	r := &receiver0{outgoingChannel}
-	gameChannel.AddReceiver(r)
+	eventReceiver := &receiver0{outgoingChannel}
+	clientID := ""
+	gameChannel.AddReceiver(eventReceiver)
 	defer func() {
+		gameChannel.RemoveReceiver(eventReceiver)
 		c.Close()
-		gameChannel.RemoveReceiver(r)
+		gsLock.Lock()
+		if gameState != nil && clientID != "" {
+			delete(gameState.JoinedPlayers, clientID)
+		}
+		gsLock.Unlock()
 	}()
 
 	go func() {
+		defer close(done)
 		for {
 			m := ClientMessage{}
 			err := c.ReadJSON(&m)
@@ -314,8 +203,79 @@ func mainScreenHandler(context echo.Context) error {
 				log.Printf("read json error %v\n", err)
 				break
 			}
-			log.Printf("got: %+v\n", m)
-			log.Printf("current game: %+v\n", gameRound)
+			//log.Printf("got: %+v\n", m)
+
+			switch m.Type {
+			case clientJoinGame:
+				var newGame bool
+				gsLock.Lock()
+				if gameState == nil || gameState.State == stop {
+					gameState = &GameState{JoinedPlayers: make(map[string]Player), State: waitingJoin}
+					newGame = true
+				}
+				if gameState.State != waitingJoin {
+					log.Printf("state %s not allow join\n", gameState.State)
+					c.WriteJSON(ServerMessage{
+						Type: evLater,
+						Data: map[string]interface{}{
+							"state": gameState,
+						},
+					})
+					continue
+				}
+				gameState.JoinedPlayers[m.ClientID] = Player{m.ClientID}
+				gsLock.Unlock()
+				clientID = m.ClientID
+				if newGame {
+					gameChannel.Send(ServerMessage{
+						Type: evGameNew,
+					})
+					go startCountingStartGame()
+				}
+				gameChannel.Send(ServerMessage{
+					Type: evPlayerJoined,
+					Data: map[string]interface{}{
+						"state": gameState,
+					},
+				})
+			case clientFetchDisc:
+				count := m.Data["count"]
+				gsLock.Lock()
+				if gameState == nil || gameState.State != playing {
+					gsLock.Unlock()
+					continue
+				}
+				if count == "1" {
+					if gameState != nil && gameState.State == playing {
+						gameState.DiscLeft = gameState.DiscLeft - 1
+						gameState.CleanItem = gameState.CleanItem + 1
+					}
+				}
+				if gameState.DiscLeft == 0 {
+					if gameStartingTicker != nil {
+						gameStartingTicker.Stop()
+					}
+					gameState.State = stop
+					gameState.PlayedTime = time.Now().Sub(gameState.StartTime)
+					gameState.PlayedTimeSeconds = gameState.PlayedTime.Seconds()
+					gameChannel.Send(ServerMessage{
+						Type: evGameWin,
+						Data: map[string]interface{}{
+							"state": gameState,
+						},
+					})
+					log.Printf("game win in %v\n", gameState.PlayedTime.Seconds())
+				} else {
+					c.WriteJSON(ServerMessage{
+						Type: evGameContinue,
+						Data: map[string]interface{}{
+							"state": gameState,
+						},
+					})
+				}
+				gsLock.Unlock()
+			}
+			log.Println("current game: ", gameState.DiscLeft, gameState.SecondsLeft)
 		}
 	}()
 
@@ -325,6 +285,8 @@ func mainScreenHandler(context echo.Context) error {
 			if err := c.WriteJSON(event); err != nil {
 				break
 			}
+		case <-done:
+			break
 		}
 	}
 
@@ -337,10 +299,8 @@ func main() {
 	flag.Parse()
 	e := echo.New()
 	e.Static("/content", "./content")
-	e.GET("/game_event", eventHandler)
-	e.GET("/game_join", gameJoinHandler)
+	e.GET("/game_join", gameJoin)
 	e.GET("/game_setup", gameSetupHandler)
-	e.GET("/game_main_screen", mainScreenHandler)
 	go func() {
 		http.ListenAndServe(":5555", nil)
 	}()
