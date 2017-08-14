@@ -3,8 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/gorilla/websocket"
-	"github.com/labstack/echo"
 	l "log"
 	"net/http"
 	_ "net/http/pprof"
@@ -12,6 +10,9 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/labstack/echo"
 )
 
 const (
@@ -278,15 +279,15 @@ func gameJoin(context echo.Context) error {
 			log.Println("current game: ", gameState.DiscLeft, gameState.SecondsLeft)
 		}
 	}()
-
+outside:
 	for {
 		select {
 		case event := <-outgoingChannel:
 			if err := c.WriteJSON(event); err != nil {
-				break
+				break outside
 			}
 		case <-done:
-			break
+			break outside
 		}
 	}
 
