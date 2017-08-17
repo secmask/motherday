@@ -18,6 +18,7 @@ import (
 const (
 	defaultDiskPerPlayer        = 30
 	defaultRoundDurationSeconds = 30
+	defaultJoinWait             = 15
 	playing                     = "playing"
 	waitingJoin                 = "waiting_join"
 	stop                        = "stop"
@@ -47,6 +48,7 @@ var (
 
 	discsPerPlayer       int64 = defaultDiskPerPlayer // this is not fixed number of disk for one player, just help to calculate total disk for a round
 	roundDurationSeconds int64 = defaultRoundDurationSeconds
+	joinWaitTime         int64 = defaultJoinWait
 	gameState            *GameState
 	gsLock               sync.Mutex
 	gameStartingTicker   *time.Ticker
@@ -103,8 +105,15 @@ func gameSetupHandler(context echo.Context) error {
 		roundDurationSeconds = defaultRoundDurationSeconds
 	}
 
+	waitTime := context.FormValue("join_wait")
+	joinWaitTime, err = strconv.ParseInt(waitTime, 10, 0)
+	if err != nil || joinWaitTime == 0 {
+		joinWaitTime = defaultJoinWait
+	}
+
 	fmt.Fprintf(context.Response(), "disc_per_player = %d\n", discsPerPlayer)
-	fmt.Fprintf(context.Response(), "round_time = %ds\n", roundDurationSeconds)
+	fmt.Fprintf(context.Response(), "round_time = %d (s)\n", roundDurationSeconds)
+	fmt.Fprintf(context.Response(), "join_wait = %ds\n", joinWaitTime)
 
 	return nil
 }
