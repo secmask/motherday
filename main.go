@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultDiskPerPlayer        = 30
-	defaultRoundDurationSeconds = 30
+	defaultRoundDurationSeconds = 45
 	defaultJoinWait             = 15
 	playing                     = "playing"
 	waitingJoin                 = "waiting_join"
@@ -118,9 +118,10 @@ func gameSetupHandler(context echo.Context) error {
 	return nil
 }
 
+var timeCountDown int64
+
 func startCountingStartGame() {
 	gameStartingTicker = time.NewTicker(time.Second)
-	var timeCountDown int64 = 15
 	for range gameStartingTicker.C {
 		gameChannel.Send(ServerMessage{
 			Type: evGameWaitingJoin,
@@ -240,6 +241,7 @@ func gameJoin(context echo.Context) error {
 					gameChannel.Send(ServerMessage{
 						Type: evGameNew,
 					})
+					timeCountDown = joinWaitTime
 					go startCountingStartGame()
 				}
 				gameChannel.Send(ServerMessage{
@@ -279,7 +281,8 @@ func gameJoin(context echo.Context) error {
 					c.WriteJSON(ServerMessage{
 						Type: evGameContinue,
 						Data: map[string]interface{}{
-							"state": gameState,
+							"state":   gameState,
+							"seconds": timeCountDown,
 						},
 					})
 				}
